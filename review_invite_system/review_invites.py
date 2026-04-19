@@ -47,13 +47,11 @@ query FindOrders($query: String!) {
       tags
       createdAt
       displayFulfillmentStatus
-      fulfillments(first: 20) {
-        nodes {
-          trackingInfo(first: 20) {
-            company
-            number
-            url
-          }
+      fulfillments {
+        trackingInfo {
+          company
+          number
+          url
         }
       }
     }
@@ -75,13 +73,11 @@ query ListOrders($query: String!, $after: String) {
       tags
       createdAt
       displayFulfillmentStatus
-      fulfillments(first: 20) {
-        nodes {
-          trackingInfo(first: 20) {
-            company
-            number
-            url
-          }
+      fulfillments {
+        trackingInfo {
+          company
+          number
+          url
         }
       }
     }
@@ -1040,7 +1036,11 @@ def extract_tracking_candidates(order: Dict[str, Any]) -> List[Tuple[str, str]]:
     candidates: List[Tuple[str, str]] = []
     seen: set[Tuple[str, str]] = set()
 
-    for fulfillment in (order.get("fulfillments") or {}).get("nodes", []):
+    fulfillments = order.get("fulfillments") or []
+    if isinstance(fulfillments, dict):
+        fulfillments = fulfillments.get("nodes", [])
+
+    for fulfillment in fulfillments:
         for tracking in fulfillment.get("trackingInfo") or []:
             carrier = str(tracking.get("company") or "").strip().lower()
             tracking_number = str(tracking.get("number") or "").strip()
