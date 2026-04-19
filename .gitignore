@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+review_invite_system/.env
+review_invite_system/.venv/
+review_invite_system/data/
+review_invite_system/*.db
+review_invite_system/*results*.csv
+review_invite_system/problematic_orders.csv
