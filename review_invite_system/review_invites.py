@@ -26,7 +26,9 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -35,6 +37,9 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template_string, request
+
+
+BATCH_CHUNK_SIZE = 250
 
 
 GET_ORDERS_QUERY = """
@@ -306,6 +311,69 @@ ADMIN_PAGE_TEMPLATE = """
           <p class="empty">No problem orders are currently flagged.</p>
           {% endif %}
         </div>
+      </section>
+      <section class="panel" style="margin-top: 20px;">
+        <h2>Latest Manual Batch</h2>
+        {% if latest_batch_job %}
+        <div class="stats">
+          <div class="stat">
+            <strong>{{ latest_batch_job.status }}</strong>
+            <span>status</span>
+          </div>
+          <div class="stat">
+            <strong>{{ latest_batch_job.processed_count }}/{{ latest_batch_job.total_count }}</strong>
+            <span>processed</span>
+          </div>
+          <div class="stat">
+            <strong>{{ latest_batch_job.mode }}</strong>
+            <span>mode</span>
+          </div>
+          <div class="stat">
+            <strong>{{ latest_batch_job.batch_size }}</strong>
+            <span>chunk size</span>
+          </div>
+        </div>
+        {% if latest_batch_counts %}
+        <div class="stats">
+          {% for row in latest_batch_counts %}
+          <div class="stat">
+            <strong>{{ row.count }}</strong>
+            <span>{{ row.status }}</span>
+          </div>
+          {% endfor %}
+        </div>
+        {% endif %}
+        {% if latest_batch_job.error_detail %}
+        <div class="message">{{ latest_batch_job.error_detail }}</div>
+        {% endif %}
+        {% if latest_batch_results %}
+        <p class="note">Showing the most recent 200 result rows. Refresh this page to update progress while a job is running.</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Order</th>
+              <th>Email</th>
+              <th>Status</th>
+              <th>Detail</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in latest_batch_results %}
+            <tr>
+              <td>{{ row.shopify_order_name or row.input_order_number }}</td>
+              <td>{{ row.email }}</td>
+              <td>{{ row.status }}</td>
+              <td>{{ row.detail }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <p class="empty">No result rows have been written for this batch yet.</p>
+        {% endif %}
+        {% else %}
+        <p class="empty">No manual batch has been started yet.</p>
+        {% endif %}
       </section>
       <section class="panel" style="margin-top: 20px;">
         <h2>Last Backfill Run</h2>
@@ -626,6 +694,193 @@ class Database:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS batch_jobs (
+                    id TEXT PRIMARY KEY,
+                    mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    total_count INTEGER NOT NULL,
+                    processed_count INTEGER NOT NULL,
+                    batch_size INTEGER NOT NULL,
+                    order_numbers_json TEXT NOT NULL,
+                    error_detail TEXT,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS batch_job_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL,
+                    input_order_number TEXT,
+                    normalized_order_number TEXT,
+                    shopify_order_name TEXT,
+                    email TEXT,
+                    status TEXT,
+                    detail TEXT,
+                    brevo_message_id TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(job_id) REFERENCES batch_jobs(id)
+                )
+                """
+            )
+
+    def create_batch_job(
+        self,
+        mode: str,
+        order_numbers: List[str],
+        batch_size: int,
+    ) -> str:
+        job_id = uuid.uuid4().hex
+        now = isoformat_utc(utc_now())
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO batch_jobs (
+                    id, mode, status, total_count, processed_count, batch_size,
+                    order_numbers_json, error_detail, created_at, started_at,
+                    completed_at, updated_at
+                ) VALUES (?, ?, 'pending', ?, 0, ?, ?, NULL, ?, NULL, NULL, ?)
+                """,
+                (
+                    job_id,
+                    mode,
+                    len(order_numbers),
+                    batch_size,
+                    json.dumps(order_numbers),
+                    now,
+                    now,
+                ),
+            )
+        return job_id
+
+    def get_batch_job(self, job_id: str) -> Optional[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM batch_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+
+    def get_latest_batch_job(self) -> Optional[Dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM batch_jobs
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_active_batch_job(self) -> Optional[Dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM batch_jobs
+                WHERE status IN ('pending', 'running')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_batch_job(
+        self,
+        job_id: str,
+        status: str,
+        processed_count: Optional[int] = None,
+        error_detail: Optional[str] = None,
+        started_at: Optional[str] = None,
+        completed_at: Optional[str] = None,
+    ) -> None:
+        existing = self.get_batch_job(job_id)
+        if not existing:
+            return
+
+        now = isoformat_utc(utc_now())
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE batch_jobs
+                SET status = ?,
+                    processed_count = ?,
+                    error_detail = ?,
+                    started_at = COALESCE(?, started_at),
+                    completed_at = COALESCE(?, completed_at),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    processed_count if processed_count is not None else existing["processed_count"],
+                    error_detail if error_detail is not None else existing["error_detail"],
+                    started_at,
+                    completed_at,
+                    now,
+                    job_id,
+                ),
+            )
+
+    def append_batch_results(self, job_id: str, results: List[Dict[str, str]]) -> None:
+        now = isoformat_utc(utc_now())
+        with self.connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO batch_job_results (
+                    job_id, input_order_number, normalized_order_number,
+                    shopify_order_name, email, status, detail, brevo_message_id,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        job_id,
+                        row.get("input_order_number", ""),
+                        row.get("normalized_order_number", ""),
+                        row.get("shopify_order_name", ""),
+                        row.get("email", ""),
+                        row.get("status", ""),
+                        row.get("detail", ""),
+                        row.get("brevo_message_id", ""),
+                        now,
+                    )
+                    for row in results
+                ],
+            )
+
+    def list_batch_results(self, job_id: str, limit: int = 200) -> List[Dict[str, str]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT input_order_number, normalized_order_number, shopify_order_name,
+                       email, status, detail, brevo_message_id
+                FROM batch_job_results
+                WHERE job_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (job_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_batch_result_counts(self, job_id: str) -> List[Dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM batch_job_results
+                WHERE job_id = ?
+                GROUP BY status
+                ORDER BY count DESC
+                """,
+                (job_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def upsert_shipment(self, shipment: Dict[str, Any]) -> None:
         now = isoformat_utc(utc_now())
@@ -1499,6 +1754,74 @@ def build_last_run_payload(
     }
 
 
+def get_latest_batch_context(db: Database) -> Dict[str, Any]:
+    latest_job = db.get_latest_batch_job()
+    if not latest_job:
+        return {
+            "latest_batch_job": None,
+            "latest_batch_results": [],
+            "latest_batch_counts": [],
+        }
+
+    return {
+        "latest_batch_job": latest_job,
+        "latest_batch_results": db.list_batch_results(latest_job["id"], limit=200),
+        "latest_batch_counts": db.list_batch_result_counts(latest_job["id"]),
+    }
+
+
+def run_manual_batch_job(config: AppConfig, job_id: str) -> None:
+    db = Database(config.database_path)
+    sender = ReviewInviteSender(config)
+    job = db.get_batch_job(job_id)
+    if not job:
+        return
+
+    started_at = isoformat_utc(utc_now())
+    db.update_batch_job(job_id, "running", started_at=started_at)
+    processed_count = 0
+
+    try:
+        order_numbers = json.loads(job["order_numbers_json"])
+        if not isinstance(order_numbers, list):
+            raise RuntimeError("Batch job order list is invalid.")
+
+        mode = str(job["mode"])
+        dry_run = mode != "send"
+        batch_size = int(job["batch_size"] or BATCH_CHUNK_SIZE)
+
+        for start in range(0, len(order_numbers), batch_size):
+            chunk = [str(value) for value in order_numbers[start : start + batch_size]]
+            results = process_orders(sender, chunk, dry_run=dry_run)
+            db.append_batch_results(job_id, results)
+            processed_count += len(results)
+            db.update_batch_job(job_id, "running", processed_count=processed_count)
+
+        db.update_batch_job(
+            job_id,
+            "completed",
+            processed_count=processed_count,
+            completed_at=isoformat_utc(utc_now()),
+        )
+    except Exception as exc:
+        db.update_batch_job(
+            job_id,
+            "failed",
+            processed_count=processed_count,
+            error_detail=str(exc),
+            completed_at=isoformat_utc(utc_now()),
+        )
+
+
+def start_manual_batch_job(config: AppConfig, job_id: str) -> None:
+    worker = threading.Thread(
+        target=run_manual_batch_job,
+        args=(config, job_id),
+        daemon=True,
+    )
+    worker.start()
+
+
 def require_admin_token(config: AppConfig) -> Optional[Response]:
     supplied = request.headers.get("X-Admin-Token") or request.args.get("token", "")
     if supplied != config.admin_token:
@@ -1618,6 +1941,7 @@ def create_app(config: AppConfig) -> Flask:
                 review_tag=config.review_tag,
                 problem_rows=prepare_problem_rows_for_display(rows),
                 last_run=admin_state["last_run"],
+                **get_latest_batch_context(db),
             ),
             mimetype="text/html",
         )
@@ -1652,17 +1976,18 @@ def create_app(config: AppConfig) -> Flask:
             order_numbers = parse_order_numbers_text(raw_text)
             if not order_numbers:
                 raise RuntimeError("Add at least one Shopify order number or upload a CSV file.")
+            active_job = db.get_active_batch_job()
+            if active_job:
+                raise RuntimeError(
+                    "A manual batch is already running. Wait for it to complete before starting another one."
+                )
 
-            results = process_orders(sender, order_numbers, dry_run=(mode != "send"))
-            admin_state["last_run"] = build_last_run_payload(
-                "manual list",
-                "manual list",
-                mode,
-                results,
-            )
+            job_id = db.create_batch_job(mode, order_numbers, BATCH_CHUNK_SIZE)
+            start_manual_batch_job(config, job_id)
             message = (
-                f"Manual order upload completed in {mode} mode. "
-                f"Checked {len(results)} order(s)."
+                f"Manual batch started in {mode} mode. "
+                f"{len(order_numbers)} order(s) will be processed in chunks of {BATCH_CHUNK_SIZE}. "
+                "Refresh this page to see progress."
             )
             return Response(
                 render_template_string(
@@ -1675,6 +2000,7 @@ def create_app(config: AppConfig) -> Flask:
                     review_tag=config.review_tag,
                     problem_rows=prepare_problem_rows_for_display(rows),
                     last_run=admin_state["last_run"],
+                    **get_latest_batch_context(db),
                 ),
                 mimetype="text/html",
             )
@@ -1690,10 +2016,29 @@ def create_app(config: AppConfig) -> Flask:
                     review_tag=config.review_tag,
                     problem_rows=prepare_problem_rows_for_display(rows),
                     last_run=admin_state["last_run"],
+                    **get_latest_batch_context(db),
                 ),
                 mimetype="text/html",
                 status=400,
             )
+
+    @app.get("/admin/batch-job/<job_id>")
+    def admin_batch_job(job_id: str) -> Response:
+        auth_error = require_admin_token(config)
+        if auth_error:
+            return auth_error
+
+        job = db.get_batch_job(job_id)
+        if not job:
+            return jsonify({"error": "Batch job not found"}), 404
+
+        return jsonify(
+            {
+                "job": dict(job),
+                "counts": db.list_batch_result_counts(job_id),
+                "results": db.list_batch_results(job_id, limit=200),
+            }
+        )
 
     @app.post("/admin/backfill-date-range")
     def admin_backfill_date_range() -> Response:
@@ -1739,6 +2084,7 @@ def create_app(config: AppConfig) -> Flask:
                     review_tag=config.review_tag,
                     problem_rows=prepare_problem_rows_for_display(rows),
                     last_run=admin_state["last_run"],
+                    **get_latest_batch_context(db),
                 ),
                 mimetype="text/html",
             )
@@ -1758,6 +2104,7 @@ def create_app(config: AppConfig) -> Flask:
                     review_tag=config.review_tag,
                     problem_rows=prepare_problem_rows_for_display(rows),
                     last_run=admin_state["last_run"],
+                    **get_latest_batch_context(db),
                 ),
                 mimetype="text/html",
                 status=400,

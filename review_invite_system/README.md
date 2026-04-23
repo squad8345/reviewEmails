@@ -14,6 +14,7 @@ Shippo support is still in the codebase, but it is optional and not required for
 - Skips orders already tagged with `review_email_sent`
 - Supports dry runs before live sends
 - Includes a simple admin page for manual uploads
+- Processes large manual uploads in background batches of 250 orders
 - Still includes CSV mode and optional Shopify date-range backfill
 
 ## Required environment variables
@@ -81,14 +82,18 @@ From there you can:
 - run a dry run
 - run a live send
 - see the latest run results
+- upload large files, such as 6,000 orders, without keeping the browser request open
 
 The manual upload flow uses the same Shopify tag check as your older script, so already-sent orders are skipped automatically.
+
+Large uploads are processed as background jobs in chunks of 250. Refresh the admin page to see progress and recent result rows.
 
 ## Endpoints
 
 - `GET /health`
 - `GET /admin?token=ADMIN_TOKEN`
 - `POST /admin/upload-orders?token=ADMIN_TOKEN`
+- `GET /admin/batch-job/<job_id>?token=ADMIN_TOKEN`
 - `POST /admin/backfill-date-range?token=ADMIN_TOKEN`
 
 Shippo-only endpoints, if you enable Shippo later:
